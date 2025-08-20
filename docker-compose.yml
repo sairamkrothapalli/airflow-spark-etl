@@ -1,0 +1,128 @@
+version: "3.9"
+
+x-airflow-image: &airflow_image apache/airflow:3.0.0
+x-airflow-env: &airflow_env
+  AIRFLOW__CORE__EXECUTOR: LocalExecutor
+  AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+  AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+  AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+  AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "True"
+  # Make a Spark connection named spark_default for SparkSubmitOperator:
+  AIRFLOW_CONN_SPARK_DEFAULT: "spark://spark-master:7077"
+  # Install needed providers at container start (dev only):
+  AIRFLOW_PIP_ADDITIONAL_REQUIREMENTS: >-
+    apache-airflow-providers-apache-spark
+    apache-airflow-providers-fab
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow -d airflow"]
+      interval: 5s
+      retries: 10
+
+  airflow-init:
+    image: *airflow_image
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      <<: *airflow_env
+    user: "${AIRFLOW_UID:-50000}:0"
+    # Airflow 3: use db migrate; users CLI is provided by FAB provider
+    command: >
+      bash -lc "
+        airflow db migrate &&
+        airflow fab-db migrate &&
+        airflow users create
+          --username admin
+          --password admin
+          --firstname Air
+          --lastname Flow
+          --role Admin
+          --email admin@example.com || true
+      "
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/spark_jobs:/opt/etl
+
+  airflow-api:
+    image: *airflow_image
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    env_file: .env
+    environment:
+      <<: *airflow_env
+    user: "${AIRFLOW_UID:-50000}:0"
+    ports:
+      - "8080:8080"
+    # Airflow 3 replacement for webserver
+    command: api-server
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/spark_jobs:/opt/etl
+
+  airflow-scheduler:
+    image: *airflow_image
+    depends_on:
+      postgres:
+        condition: service_healthy
+      airflow-init:
+        condition: service_completed_successfully
+      spark-master:
+        condition: service_started
+    env_file: .env
+    environment:
+      <<: *airflow_env
+    user: "${AIRFLOW_UID:-50000}:0"
+    command: scheduler
+    volumes:
+      - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR:-.}/spark_jobs:/opt/etl
+
+  spark-master:
+    image: bitnami/spark:3.5.3
+    environment:
+      - SPARK_MODE=master
+      - SPARK_NO_DAEMONIZE=true
+    ports:
+      - "7077:7077"
+      - "8081:8080"
+    healthcheck:
+      test: ["CMD", "bash", "-lc", "curl -sf http://localhost:8080 || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 20
+
+  spark-worker:
+    image: bitnami/spark:3.5.3
+    depends_on:
+      spark-master:
+        condition: service_started
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+
+volumes:
+  postgres-data:
